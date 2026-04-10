@@ -29,7 +29,8 @@ if (IS_PROD && missing.length) {
 const CLICKUP = {
   clientId:     process.env.CLICKUP_CLIENT_ID     || '',
   clientSecret: process.env.CLICKUP_CLIENT_SECRET || '',
-  redirectUri:  `${BASE_URL}/auth/clickup/callback`,
+  // ClickUp strips paths from registered redirect URIs — use base URL only
+  redirectUri:  `${BASE_URL}`,
 };
 const TODOIST = {
   clientId:     process.env.TODOIST_CLIENT_ID     || '',
@@ -99,13 +100,17 @@ async function httpJSON(options, body) {
   return data;
 }
 
-async function fetchBinary(urlStr, headers = {}) {
-  // Follows redirects (ClickUp attachment URLs often redirect to S3)
+async function fetchBinary(urlStr, headers = {}, _hops = 0) {
+  if (_hops > 5) throw new Error('Too many redirects fetching attachment');
   const u = new URL(urlStr);
+  // Only allow https: (and http: for localhost dev) — prevent SSRF to internal services
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && u.hostname === 'localhost')) {
+    throw new Error(`Blocked download from disallowed protocol: ${u.protocol}`);
+  }
   const res = await httpRequest({ hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers, protocol: u.protocol });
   if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
     // On redirect, drop auth headers — S3 pre-signed URLs don't want them
-    return fetchBinary(res.headers.location, {});
+    return fetchBinary(res.headers.location, {}, _hops + 1);
   }
   if (res.statusCode >= 400) throw new Error(`Download failed: HTTP ${res.statusCode}`);
   return { data: res.body, contentType: res.headers['content-type'] || 'application/octet-stream' };
@@ -204,7 +209,13 @@ function tdReq(method, path, token, body) {
 }
 
 const tdGetProjects  = (token) => tdReq('GET',  '/api/v1/projects', token);
-const tdCreateProj   = (token, name) => tdReq('POST', '/api/v1/projects', token, { name, color: 'grape' });
+async function tdCreateProj(token, name) {
+  const raw = await tdReq('POST', '/api/v1/projects', token, { name });
+  // API may return the project directly or wrapped in { project: {...} }
+  const proj = raw?.project || raw;
+  if (!proj?.id) throw new Error(`Project creation returned no ID`);
+  return proj;
+}
 const tdCreateTask   = (token, body) => tdReq('POST', '/api/v1/tasks', token, body);
 const tdCreateComment = (token, body) => tdReq('POST', '/api/v1/comments', token, body);
 
@@ -279,6 +290,7 @@ async function importList(listId, projectId, opts, tokens, emit, abortRef) {
             await sleep(wait);
             attempt++;
           } else {
+            console.error(`[importTask] failed projectId=${projectId}:`, err.message);
             emit({ type: 'task', status: 'error', name: task.name, error: err.message });
             return;
           }
@@ -343,18 +355,46 @@ async function runImport(config, tokens, emit) {
     emit(event);
   }
 
-  let projectId = config.projectId;
-  if (config.newProjectName && !config.dryRun) {
-    const proj = await tdCreateProj(tokens.todoist, config.newProjectName);
-    projectId = proj.id;
-    emit({ type: 'log', message: `Created Todoist project "${config.newProjectName}"` });
-  } else if (config.newProjectName && config.dryRun) {
-    projectId = 'dry-project';
-    emit({ type: 'log', message: `[DRY RUN] Would create project "${config.newProjectName}"` });
+  const mode     = config.projectMode || 'existing';
+  const listMap  = config.listMap || {};
+
+  // Resolve a single shared project for 'existing' and 'new' modes
+  let sharedProjectId = config.projectId;
+
+  if (mode === 'new') {
+    if (!config.dryRun) {
+      const proj = await tdCreateProj(tokens.todoist, config.newProjectName);
+      sharedProjectId = proj.id;
+      emit({ type: 'log', message: `Created Todoist project "${config.newProjectName}"` });
+    } else {
+      sharedProjectId = 'dry-project';
+      emit({ type: 'log', message: `[DRY RUN] Would create project "${config.newProjectName}"` });
+    }
   }
 
   for (const listId of config.listIds) {
     if (abortRef.aborted) break;
+
+    let projectId = sharedProjectId;
+
+    if (mode === 'per-list') {
+      const listName = listMap[listId] || `ClickUp List ${listId}`;
+      if (!config.dryRun) {
+        try {
+          const proj = await tdCreateProj(tokens.todoist, listName);
+          projectId = proj.id;
+          emit({ type: 'log', message: `Created Todoist project "${listName}"` });
+        } catch (err) {
+          emit({ type: 'task', status: 'error', name: `[Project] ${listName}`, error: `Could not create project: ${err.message}` });
+          continue;
+        }
+      } else {
+        projectId = `dry-${listId}`;
+        emit({ type: 'log', message: `[DRY RUN] Would create project "${listName}"` });
+      }
+      await sleep(150);
+    }
+
     await importList(listId, projectId, config, tokens, track, abortRef);
   }
 
@@ -441,6 +481,13 @@ select:focus,input[type=text]:focus{border-color:#7c4dff;box-shadow:0 0 0 3px rg
 .project-or{text-align:center;color:#9ca3af;font-size:13px;margin:12px 0;position:relative}
 .project-or::before{content:'';position:absolute;left:0;top:50%;width:100%;height:1px;background:#e5e7eb}
 .project-or span{background:#fff;padding:0 8px;position:relative}
+.radio-options{display:flex;flex-direction:column;gap:2px;margin-bottom:14px}
+.radio-row{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1.5px solid #e5e7eb;border-radius:8px;cursor:pointer;transition:border-color .15s,background .15s}
+.radio-row:has(input:checked){border-color:#7c4dff;background:#faf7ff}
+.radio-row input[type=radio]{width:16px;height:16px;accent-color:#7c4dff;cursor:pointer;flex-shrink:0;margin-top:2px}
+.radio-row .label-text{font-size:14px;color:#374151;font-weight:500}
+.radio-row .label-hint{font-size:12px;color:#9ca3af;margin-top:2px}
+.project-sub{margin-top:12px}
 
 /* Progress */
 .progress-bar-wrap{background:#e5e7eb;border-radius:99px;height:8px;margin-bottom:24px;overflow:hidden}
@@ -535,12 +582,42 @@ select:focus,input[type=text]:focus{border-color:#7c4dff;box-shadow:0 0 0 3px rg
 
     <div class="form-section">
       <h2>To Todoist</h2>
-      <label>Destination project</label>
-      <select id="project-select">
-        <option value="">Loading projects…</option>
-      </select>
-      <div class="project-or"><span>or</span></div>
-      <input type="text" id="new-project-name" placeholder="Create new project named…" oninput="onNewProjectInput()" />
+      <div class="radio-options">
+        <label class="radio-row">
+          <input type="radio" name="project-mode" value="existing" checked onchange="onProjectModeChange()">
+          <span>
+            <div class="label-text">Use an existing project</div>
+            <div class="label-hint">Import all selected lists into one Todoist project</div>
+          </span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="project-mode" value="new" onchange="onProjectModeChange()">
+          <span>
+            <div class="label-text">Create a new project</div>
+            <div class="label-hint">Import all selected lists into a single new project</div>
+          </span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="project-mode" value="per-list" onchange="onProjectModeChange()">
+          <span>
+            <div class="label-text">One project per ClickUp list</div>
+            <div class="label-hint">Each selected list becomes its own Todoist project</div>
+          </span>
+        </label>
+      </div>
+      <div class="project-sub" id="sub-existing">
+        <label>Destination project</label>
+        <select id="project-select">
+          <option value="">Loading projects…</option>
+        </select>
+      </div>
+      <div class="project-sub" id="sub-new" style="display:none">
+        <label>New project name</label>
+        <input type="text" id="new-project-name" placeholder="e.g. Imported from ClickUp" />
+      </div>
+      <div class="project-sub" id="sub-per-list" style="display:none">
+        <div class="alert alert-info" style="margin:0">Each selected list will be created as a separate project in Todoist, named after the list.</div>
+      </div>
     </div>
 
     <div class="form-section">
@@ -568,7 +645,6 @@ select:focus,input[type=text]:focus{border-color:#7c4dff;box-shadow:0 0 0 3px rg
   <h1 id="progress-title">Importing…</h1>
   <p class="subtitle" id="progress-subtitle">Please keep this tab open.</p>
   <div class="progress-bar-wrap"><div class="progress-bar-fill" id="progress-bar"></div></div>
-  <div id="progress-log"></div>
 </div>
 
 <!-- ── View: Done ────────────────────────────────────────────────────────── -->
@@ -577,8 +653,14 @@ select:focus,input[type=text]:focus{border-color:#7c4dff;box-shadow:0 0 0 3px rg
   <p class="subtitle" id="done-subtitle"></p>
   <div class="summary-grid" id="summary-grid"></div>
   <div id="done-alerts"></div>
-  <button class="btn btn-primary" onclick="showView('configure')">Import more lists</button>
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <button class="btn btn-primary" onclick="showView('configure')">Import more lists</button>
+    <button class="btn btn-ghost" id="btn-toggle-log" onclick="toggleLog()">Show log ▾</button>
+  </div>
 </div>
+
+<!-- ── Persistent log (shared between progress + done views) ─────────────── -->
+<div id="progress-log" style="margin-top:16px;display:none"></div>
 
 </main>
 
@@ -723,11 +805,11 @@ async function loadProjects() {
   }
 }
 
-function onNewProjectInput() {
-  const val = document.getElementById('new-project-name').value.trim();
-  const sel = document.getElementById('project-select');
-  if (val) { sel.disabled = true; sel.style.opacity = '.4'; }
-  else     { sel.disabled = false; sel.style.opacity = ''; }
+function onProjectModeChange() {
+  const mode = document.querySelector('input[name="project-mode"]:checked').value;
+  document.getElementById('sub-existing').style.display  = mode === 'existing'  ? '' : 'none';
+  document.getElementById('sub-new').style.display       = mode === 'new'       ? '' : 'none';
+  document.getElementById('sub-per-list').style.display  = mode === 'per-list'  ? '' : 'none';
 }
 
 // ── Start import ────────────────────────────────────────────────────────────
@@ -735,14 +817,32 @@ async function startImport() {
   const listIds = [...state.selectedLists];
   if (listIds.length === 0) { alert('Please select at least one list.'); return; }
 
-  const newName  = document.getElementById('new-project-name').value.trim();
-  const projId   = newName ? null : document.getElementById('project-select').value;
-  if (!newName && !projId) { alert('Please select or create a Todoist project.'); return; }
+  const mode = document.querySelector('input[name="project-mode"]:checked').value;
+
+  let projectId      = null;
+  let newProjectName = null;
+
+  if (mode === 'existing') {
+    projectId = document.getElementById('project-select').value;
+    if (!projectId) { alert('Please select a Todoist project.'); return; }
+  } else if (mode === 'new') {
+    newProjectName = document.getElementById('new-project-name').value.trim();
+    if (!newProjectName) { alert('Please enter a name for the new project.'); return; }
+  }
+  // mode === 'per-list': no extra input needed
+
+  // Build list map so server knows each list's name for per-list mode
+  const listMap = {};
+  document.querySelectorAll('input[data-listid]:checked').forEach(cb => {
+    listMap[cb.dataset.listid] = cb.closest('.tree-list')?.querySelector('.tree-list-name')?.textContent || cb.dataset.listid;
+  });
 
   const config = {
     listIds,
-    projectId:      projId || null,
-    newProjectName: newName || null,
+    listMap,
+    projectMode:    mode,
+    projectId:      projectId || null,
+    newProjectName: newProjectName || null,
     includeAttachments: document.getElementById('opt-attachments').checked,
     includeClosed:      document.getElementById('opt-closed').checked,
     dryRun:             document.getElementById('opt-dryrun').checked,
@@ -752,7 +852,9 @@ async function startImport() {
 
   state.progressTotal = 0;
   state.progressDone  = 0;
-  document.getElementById('progress-log').innerHTML = '';
+  const logEl = document.getElementById('progress-log');
+  logEl.innerHTML = '';
+  logEl.style.display = 'block';
   document.getElementById('progress-bar').style.width = '0%';
   document.getElementById('progress-title').textContent = config.dryRun ? 'Dry run preview…' : 'Importing…';
   document.getElementById('progress-subtitle').textContent = config.dryRun ? 'No changes will be made.' : 'Please keep this tab open.';
@@ -858,14 +960,34 @@ function showDone(stats, dryRun) {
     \${stats.attachmentErrors ? \`<div class="summary-stat error-stat"><div class="n">\${stats.attachmentErrors}</div><div class="label">Attachment errors</div></div>\` : ''}
   \`;
 
-  document.getElementById('done-alerts').innerHTML = (stats.taskErrors || stats.attachmentErrors)
-    ? \`<div class="alert alert-warning">Some items failed to import — scroll up in the log to see which ones.</div>\`
-    : (dryRun ? '<div class="alert alert-info">This was a dry run. Click "Import more lists" and uncheck Dry run to run for real.</div>' : '');
+  const hasErrors = stats.taskErrors || stats.attachmentErrors;
+  document.getElementById('done-alerts').innerHTML = hasErrors
+    ? \`<div class="alert alert-warning" style="margin-bottom:16px">⚠ Some items failed to import. Use the log below to see which ones.</div>\`
+    : (dryRun ? '<div class="alert alert-info" style="margin-bottom:16px">This was a dry run. Click "Import more lists" and uncheck Dry run to run for real.</div>' : '');
+
+  // Collapse the log on done — show it expanded only if there were errors
+  const logEl = document.getElementById('progress-log');
+  const toggleBtn = document.getElementById('btn-toggle-log');
+  if (hasErrors) {
+    logEl.style.display = 'block';
+    toggleBtn.textContent = 'Hide log ▴';
+  } else {
+    logEl.style.display = 'none';
+    toggleBtn.textContent = 'Show log ▾';
+  }
 
   showView('done');
 }
 
 // ── Utils ───────────────────────────────────────────────────────────────────
+function toggleLog() {
+  const logEl    = document.getElementById('progress-log');
+  const toggleBtn = document.getElementById('btn-toggle-log');
+  const visible  = logEl.style.display !== 'none';
+  logEl.style.display    = visible ? 'none' : 'block';
+  toggleBtn.textContent  = visible ? 'Show log ▾' : 'Hide log ▴';
+}
+
 function esc(str) {
   return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -881,8 +1003,28 @@ function esc(str) {
 // Health check — used by Render, Railway, Fly, etc. to confirm the app is up
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+
 // Main page
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
+  const { code, state } = req.query;
+
+  // ClickUp redirects back to the base URL (it strips paths from redirect URIs)
+  // Detect the OAuth callback by the presence of code + state params
+  if (code && state) {
+    const expected = req.session.oauthState?.clickup;
+    if (!state || state !== expected) return res.redirect('/?error=invalid_state');
+    try {
+      const data = await cuExchangeCode(code);
+      req.session.clickupToken = data.access_token;
+      // Clear the state and redirect cleanly (no query params)
+      delete req.session.oauthState;
+      return res.redirect('/');
+    } catch (err) {
+      console.error('ClickUp token exchange failed:', err.message);
+      return res.redirect('/?error=clickup_auth_failed');
+    }
+  }
+
   res.send(renderPage({
     clickup: !!req.session.clickupToken,
     todoist: !!req.session.todoistToken,
@@ -896,13 +1038,16 @@ app.get('/auth/clickup', (req, res) => {
   const state = crypto.randomBytes(16).toString('hex');
   req.session.oauthState = req.session.oauthState || {};
   req.session.oauthState.clickup = state;
-  const url = `https://app.clickup.com/api?client_id=${encodeURIComponent(CLICKUP.clientId)}&redirect_uri=${encodeURIComponent(CLICKUP.redirectUri)}`;
+  // ClickUp supports state param for CSRF protection
+  const url = `https://app.clickup.com/api?client_id=${encodeURIComponent(CLICKUP.clientId)}&redirect_uri=${encodeURIComponent(CLICKUP.redirectUri)}&state=${state}`;
   res.redirect(url);
 });
 
 app.get('/auth/clickup/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.redirect('/?error=no_code');
+  const expected = req.session.oauthState?.clickup;
+  if (!state || state !== expected) return res.redirect('/?error=invalid_state');
   try {
     const data = await cuExchangeCode(code);
     req.session.clickupToken = data.access_token;
@@ -926,7 +1071,8 @@ app.get('/auth/todoist', (req, res) => {
 
 app.get('/auth/todoist/callback', async (req, res) => {
   const { code, state, error } = req.query;
-  if (error) return res.redirect(`/?error=${error}`);
+  // Don't reflect the raw OAuth error value into the redirect — use a safe fixed string
+  if (error) return res.redirect('/?error=todoist_auth_denied');
   const expected = req.session.oauthState?.todoist;
   if (!state || state !== expected) return res.redirect('/?error=invalid_state');
   try {
@@ -974,9 +1120,12 @@ app.get('/api/lists', async (req, res) => {
 app.get('/api/todoist-projects', async (req, res) => {
   if (!req.session.todoistToken) return res.status(401).json({ error: 'Not connected to Todoist' });
   try {
-    const projects = await tdGetProjects(req.session.todoistToken);
-    res.json((projects || []).map(p => ({ id: p.id, name: p.name })));
+    const raw = await tdGetProjects(req.session.todoistToken);
+    // API may return a plain array or { projects: [...] } or { results: [...] }
+    const list = Array.isArray(raw) ? raw : (raw.projects || raw.results || []);
+    res.json(list.map(p => ({ id: p.id, name: p.name })));
   } catch (err) {
+    console.error('todoist-projects error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -987,9 +1136,25 @@ app.post('/api/import/start', (req, res) => {
   if (!req.session.clickupToken || !req.session.todoistToken) {
     return res.status(401).json({ error: 'Not connected' });
   }
-  const { listIds, projectId, newProjectName, includeAttachments, includeClosed, dryRun } = req.body;
-  if (!listIds?.length) return res.status(400).json({ error: 'listIds required' });
-  req.session.importConfig = { listIds, projectId, newProjectName, includeAttachments, includeClosed, dryRun };
+  const { listIds, listMap, projectMode, projectId, newProjectName, includeAttachments, includeClosed, dryRun } = req.body;
+
+  // Input validation
+  const VALID_MODES = ['existing', 'new', 'per-list'];
+  if (!Array.isArray(listIds) || !listIds.length) return res.status(400).json({ error: 'listIds must be a non-empty array' });
+  if (listIds.some(id => typeof id !== 'string' || !/^\w+$/.test(id))) return res.status(400).json({ error: 'Invalid listId format' });
+  if (listIds.length > 100) return res.status(400).json({ error: 'Too many lists selected (max 100)' });
+  if (!VALID_MODES.includes(projectMode)) return res.status(400).json({ error: 'Invalid projectMode' });
+  if (newProjectName && typeof newProjectName === 'string' && newProjectName.length > 200) return res.status(400).json({ error: 'Project name too long' });
+  // Sanitise listMap — only keep keys that are valid list IDs
+  const safeListMap = {};
+  if (listMap && typeof listMap === 'object') {
+    for (const [k, v] of Object.entries(listMap)) {
+      if (/^\w+$/.test(k) && typeof v === 'string') safeListMap[k] = v.slice(0, 200);
+    }
+  }
+
+  console.log(`[import/start] projectMode=${projectMode} listCount=${listIds.length}`);
+  req.session.importConfig = { listIds, listMap: safeListMap, projectMode, projectId, newProjectName, includeAttachments: !!includeAttachments, includeClosed: !!includeClosed, dryRun: !!dryRun };
   res.json({ ok: true });
 });
 
