@@ -210,7 +210,9 @@ async function tdGetProjects(token) {
   let cursor = undefined;
   do {
     const { results, nextCursor } = await api.getProjects(cursor ? { cursor } : {});
-    all.push(...results);
+    // Filter out workspace projects — they have a workspaceId field and the
+    // REST API v1 does not support creating tasks in them via project_id.
+    all.push(...results.filter(p => !p.workspaceId));
     cursor = nextCursor;
   } while (cursor);
   return all;
@@ -272,7 +274,6 @@ async function importList(listId, projectId, opts, tokens, emit, abortRef) {
       todoistId = `dry-${task.id}`;
       emit({ type: 'task', status: 'dry_run', name: task.name });
     } else {
-      console.log(`[importTask] creating task "${task.name}" with params:`, JSON.stringify(params));
       let attempt = 0;
       while (true) {
         try {
