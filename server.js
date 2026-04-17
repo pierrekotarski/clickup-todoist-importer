@@ -3,12 +3,13 @@
 
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 
-const express       = require('express');
-const cookieSession = require('cookie-session');
-const https         = require('https');
-const http          = require('http');
-const crypto        = require('crypto');
-const { URL }       = require('url');
+const express                             = require('express');
+const cookieSession                       = require('cookie-session');
+const https                               = require('https');
+const http                                = require('http');
+const crypto                              = require('crypto');
+const { URL }                             = require('url');
+const { TodoistApi, TodoistRequestError } = require('@doist/todoist-sdk');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -197,44 +198,39 @@ async function tdExchangeCode(code) {
   }, payload);
 }
 
-function tdReq(method, path, token, body) {
-  const payload = body ? JSON.stringify(body) : undefined;
-  return httpJSON({
-    hostname: 'api.todoist.com', path, method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
-    },
-  }, payload);
+// ── Todoist SDK helpers ───────────────────────────────────────────────────────
+
+function getTdApi(token) {
+  return new TodoistApi(token);
 }
 
-const tdGetProjects  = (token) => tdReq('GET',  '/api/v1/projects', token);
+async function tdGetProjects(token) {
+  const api = getTdApi(token);
+  const all = [];
+  let cursor = undefined;
+  do {
+    const { results, nextCursor } = await api.getProjects(cursor ? { cursor } : {});
+    all.push(...results);
+    cursor = nextCursor;
+  } while (cursor);
+  return all;
+}
+
 async function tdCreateProj(token, name) {
-  const raw = await tdReq('POST', '/api/v1/projects', token, { name });
-  // API may return the project directly or wrapped in { project: {...} }
-  const proj = raw?.project || raw;
-  if (!proj?.id) throw new Error(`Project creation returned no ID`);
-  return proj;
+  return getTdApi(token).addProject({ name });
 }
-const tdCreateTask   = (token, body) => tdReq('POST', '/api/v1/tasks', token, body);
-const tdCreateComment = (token, body) => tdReq('POST', '/api/v1/comments', token, body);
 
-async function tdUploadFile(token, fileName, mimeType, fileData) {
-  const boundary = `boundary${crypto.randomBytes(12).toString('hex')}`;
-  const body = Buffer.concat([
-    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file_name"\r\n\r\n${fileName}\r\n`),
-    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: ${mimeType}\r\n\r\n`),
-    fileData,
-    Buffer.from(`\r\n--${boundary}--\r\n`),
-  ]);
-  const res = await httpRequest({
-    hostname: 'api.todoist.com', path: '/api/v1/uploads', method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
-  }, body);
-  let data;
-  try { data = JSON.parse(res.body.toString('utf8')); } catch { data = null; }
-  if (res.statusCode >= 400) throw new Error(`Upload failed ${res.statusCode}: ${res.body.toString('utf8').slice(0, 200)}`);
-  return data;
+function tdCreateTask(token, args) {
+  return getTdApi(token).addTask(args);
+}
+
+function tdCreateComment(token, args) {
+  return getTdApi(token).addComment(args);
+}
+
+function tdUploadFile(token, fileName, _mimeType, fileData) {
+  // The SDK handles multipart encoding internally; mimeType is inferred by Todoist from content
+  return getTdApi(token).uploadFile({ file: fileData, fileName });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,12 +259,12 @@ async function importList(listId, projectId, opts, tokens, emit, abortRef) {
   async function importTask(task, parentTodoistId) {
     if (abortRef.aborted) return;
     const params = {
-      content:    task.name,
-      project_id: projectId,
-      priority:   mapPriority(task.priority),
-      ...(fmtDate(task.due_date) ? { due_date: fmtDate(task.due_date) } : {}),
-      ...(task.description        ? { description: task.description }   : {}),
-      ...(parentTodoistId         ? { parent_id: parentTodoistId }      : {}),
+      content:   task.name,
+      projectId: projectId,
+      priority:  mapPriority(task.priority),
+      ...(fmtDate(task.due_date) ? { dueDate: fmtDate(task.due_date) } : {}),
+      ...(task.description        ? { description: task.description }  : {}),
+      ...(parentTodoistId         ? { parentId: parentTodoistId }      : {}),
     };
 
     let todoistId;
@@ -284,8 +280,8 @@ async function importList(listId, projectId, opts, tokens, emit, abortRef) {
           emit({ type: 'task', status: 'created', name: task.name });
           break;
         } catch (err) {
-          if (err.statusCode === 429 && attempt < 4) {
-            const wait = (err.retryAfter ?? Math.pow(2, attempt)) * 1000;
+          if (err instanceof TodoistRequestError && err.httpStatusCode === 429 && attempt < 4) {
+            const wait = Math.pow(2, attempt) * 1000;
             emit({ type: 'log', message: `Rate limited — waiting ${wait / 1000}s…` });
             await sleep(wait);
             attempt++;
@@ -319,9 +315,14 @@ async function importList(listId, projectId, opts, tokens, emit, abortRef) {
           emit({ type: 'attachment', status: 'uploading', taskName: task.name, fileName: att.title });
           const upload = await tdUploadFile(tokens.todoist, att.title, att.mimetype || contentType, data);
           await tdCreateComment(tokens.todoist, {
-            task_id: todoistId,
+            taskId:  todoistId,
             content: `📎 ${att.title}`,
-            attachment: { resource_type: upload.resource_type || 'file', file_url: upload.file_url, file_type: upload.file_type || att.mimetype || contentType, file_name: upload.file_name || att.title },
+            attachment: {
+              resourceType: upload.resourceType || 'file',
+              fileUrl:      upload.fileUrl,
+              fileType:     upload.fileType || att.mimetype || contentType,
+              fileName:     upload.fileName || att.title,
+            },
           });
           emit({ type: 'attachment', status: 'done', taskName: task.name, fileName: att.title });
           await sleep(150);
@@ -655,6 +656,7 @@ select:focus,input[type=text]:focus{border-color:#7c4dff;box-shadow:0 0 0 3px rg
   <div id="done-alerts"></div>
   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
     <button class="btn btn-primary" onclick="showView('configure')">Import more lists</button>
+    <a class="btn btn-todoist" href="https://www.todoist.com" target="_blank" rel="noopener noreferrer">Open Todoist</a>
     <button class="btn btn-ghost" id="btn-toggle-log" onclick="toggleLog()">Show log ▾</button>
   </div>
 </div>
@@ -1120,10 +1122,8 @@ app.get('/api/lists', async (req, res) => {
 app.get('/api/todoist-projects', async (req, res) => {
   if (!req.session.todoistToken) return res.status(401).json({ error: 'Not connected to Todoist' });
   try {
-    const raw = await tdGetProjects(req.session.todoistToken);
-    // API may return a plain array or { projects: [...] } or { results: [...] }
-    const list = Array.isArray(raw) ? raw : (raw.projects || raw.results || []);
-    res.json(list.map(p => ({ id: p.id, name: p.name })));
+    const projects = await tdGetProjects(req.session.todoistToken);
+    res.json(projects.map(p => ({ id: p.id, name: p.name })));
   } catch (err) {
     console.error('todoist-projects error:', err.message);
     res.status(500).json({ error: err.message });
