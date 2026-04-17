@@ -272,6 +272,7 @@ async function importList(listId, projectId, opts, tokens, emit, abortRef) {
       todoistId = `dry-${task.id}`;
       emit({ type: 'task', status: 'dry_run', name: task.name });
     } else {
+      console.log(`[importTask] creating task "${task.name}" with params:`, JSON.stringify(params));
       let attempt = 0;
       while (true) {
         try {
@@ -286,7 +287,9 @@ async function importList(listId, projectId, opts, tokens, emit, abortRef) {
             await sleep(wait);
             attempt++;
           } else {
-            console.error(`[importTask] failed projectId=${projectId}:`, err.message);
+            console.error(`[importTask] failed projectId=${projectId}:`, err.message,
+              err.httpStatusCode ? `HTTP ${err.httpStatusCode}` : '',
+              err.responseData ? JSON.stringify(err.responseData) : '');
             emit({ type: 'task', status: 'error', name: task.name, error: err.message });
             return;
           }
